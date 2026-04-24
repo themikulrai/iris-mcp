@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import shlex
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -13,15 +17,105 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from .config import SlurmConfig
-from .slurm import SlurmClient
+from .slurm import SlurmClient, parse_sgpu
 
-_JOB_ID_RE = re.compile(r"^[\d,_\-\%]+$")
+_JOB_ID_RE = re.compile(r"^\d+(_(\d+|\*))?(-\d+)?(%\d+)?(,\d+(_(\d+|\*))?)*$")
+_PARTITION_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
+_WANDB_URL_RE = re.compile(r"https://wandb\.ai/[^/\s]+/[^/\s]+/runs/[^\s)>\]]+")
+
+_TERMINAL_STATES = {
+    "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT",
+    "OUT_OF_MEMORY", "NODE_FAIL", "BOOT_FAIL", "PREEMPTED",
+}
+
+_GPU_STATUS_TTL_SECONDS = 15.0
+
+
+def _validate_partition(name: str) -> None:
+    if not _PARTITION_RE.match(name):
+        raise ToolError(f"Invalid partition name: {name!r}")
+
+
+def _write_inline_script(tmp_dir: Path, content: str) -> str:
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    fd, path = tempfile.mkstemp(suffix=".sh", dir=str(tmp_dir), prefix="job_")
+    with os.fdopen(fd, "w") as f:
+        f.write(content)
+    os.chmod(path, 0o755)
+    return path
 
 
 def create_server() -> FastMCP:
     config = SlurmConfig()
     client = SlurmClient(config)
     mcp = FastMCP("iris-mcp")
+
+    # gpu_status cache: {partition_key: (timestamp, rendered_json_text)}
+    gpu_cache: dict[str, tuple[float, str]] = {}
+
+    # wandb_for_job cache: {log_path: (mtime, url_or_none)}
+    wandb_cache: dict[str, tuple[float, Optional[str]]] = {}
+
+    # ── Helpers (close over client/config) ────────────────────────────
+
+    async def _locate_job_log(job_id: str) -> str:
+        cmd = ["sacct", "-j", job_id, "--format=WorkDir", "--parsable2", "--noheader"]
+        stdout = await client.run_remote(cmd)
+        if not stdout:
+            raise ToolError(f"Could not find working directory for job {job_id}.")
+        work_dir = stdout.splitlines()[0].split("|")[0].strip()
+
+        def _find() -> Optional[str]:
+            candidates = [
+                os.path.join(work_dir, config.output_dir, f"{job_id}.out"),
+                os.path.join(work_dir, f"slurm-{job_id}.out"),
+                os.path.join(work_dir, f"{job_id}.out"),
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    return c
+            return None
+
+        found = await asyncio.to_thread(_find)
+        if not found:
+            raise ToolError(f"No output file found for job {job_id} under {work_dir}.")
+        return found
+
+    async def _fetch_job_state(job_id: str) -> dict[str, str]:
+        """squeue-first (fast, authoritative while job is active),
+        sacct-fallback (accounting, once job has left the queue)."""
+        squeue_cmd = ["squeue", "-j", job_id, "-h", "-o", "%T|%M|%l"]
+        try:
+            squeue_out = await client.run_remote(squeue_cmd)
+        except ToolError:
+            squeue_out = ""
+        if squeue_out.strip():
+            parts = squeue_out.splitlines()[0].split("|")
+            if parts and parts[0].strip():
+                out = {"State": parts[0].strip(), "source": "squeue"}
+                if len(parts) > 1:
+                    out["Elapsed"] = parts[1].strip()
+                if len(parts) > 2:
+                    out["TimeLimit"] = parts[2].strip()
+                return out
+
+        fmt = "JobID,State,ExitCode,Elapsed,End"
+        sacct_cmd = [
+            "sacct", "-j", job_id,
+            f"--format={fmt}",
+            "--parsable2", "--noheader", "--allocations",
+        ]
+        try:
+            sacct_out = await client.run_remote(sacct_cmd)
+        except ToolError:
+            sacct_out = ""
+        if sacct_out.strip():
+            fields = fmt.split(",")
+            for line in sacct_out.splitlines():
+                cols = [c.strip() for c in line.split("|")]
+                if cols and cols[0]:
+                    return dict(zip(fields, cols)) | {"source": "sacct"}
+        return {}
 
     # ── Auth ──────────────────────────────────────────────────────────
 
@@ -50,17 +144,25 @@ def create_server() -> FastMCP:
         time_limit: Optional[str] = None,
         working_dir: Optional[str] = None,
         array: Optional[str] = None,
+        dependency: Optional[str] = None,
+        nodelist: Optional[str] = None,
+        exclude: Optional[str] = None,
+        constraint: Optional[str] = None,
         extra_args: Optional[str] = None,
     ) -> str:
         """Submit a Slurm batch job via sbatch.
 
-        Provide either script_path (path to an existing .sh file on the shared filesystem)
-        or script_content (inline script text that will be written to a temp file).
+        Provide either script_path (existing .sh on the shared filesystem) or
+        script_content (inline text, written to a temp file on the shared FS).
 
-        Uses configured defaults for partition, account, GPUs, memory, and time if not specified.
-        Automatically creates the output directory before submission.
+        Uses configured defaults for partition, account, GPUs, memory, and time
+        when not specified. Automatically creates the output directory before
+        submission.
 
-        Set array (e.g. '0-7' or '0-31%8') for job array submissions.
+        `dependency` accepts standard Slurm syntax (e.g. 'afterok:12345',
+        'afternotok:12345', 'afterany:12345:12346', 'singleton').
+        `nodelist`/`exclude` take comma-separated node lists. `constraint` takes
+        a Slurm feature expression (e.g. 'a100' or 'a100&ib').
         """
         if not script_path and not script_content:
             raise ToolError("Provide either script_path or script_content.")
@@ -69,22 +171,14 @@ def create_server() -> FastMCP:
         output_dir = config.output_dir
         output_pattern = f"{output_dir}/%j.out"
 
-        # Ensure output directory exists (on shared filesystem, so local mkdir works)
         out_path = Path(work_dir) / output_dir
-        out_path.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(out_path.mkdir, parents=True, exist_ok=True)
 
-        # Write inline script to a temp file on shared filesystem
         if script_content:
             if not script_content.startswith("#!"):
                 script_content = "#!/bin/bash\n" + script_content
             tmp_dir = Path(work_dir) / ".slurm_scripts"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            import tempfile
-            fd, tmp_path = tempfile.mkstemp(suffix=".sh", dir=str(tmp_dir), prefix="job_")
-            with os.fdopen(fd, "w") as f:
-                f.write(script_content)
-            os.chmod(tmp_path, 0o755)
-            script_path = tmp_path
+            script_path = await asyncio.to_thread(_write_inline_script, tmp_dir, script_content)
 
         args = client.build_sbatch_args(
             job_name=job_name,
@@ -98,6 +192,10 @@ def create_server() -> FastMCP:
             output_pattern=output_pattern,
             working_dir=work_dir,
             array=array,
+            dependency=dependency,
+            nodelist=nodelist,
+            exclude=exclude,
+            constraint=constraint,
             extra_args=extra_args,
         )
         args.append(script_path)
@@ -107,8 +205,13 @@ def create_server() -> FastMCP:
         msg = f"Job submitted: {stdout}"
         if script_content:
             msg += f"\nScript saved to: {script_path}"
-        if partition and "interactive" not in partition and partition == "iris":
-            msg += "\nNote: iris partition is preemptible — ensure your job supports checkpointing."
+
+        effective = partition or config.default_partition
+        if not (effective.endswith("-hi") or effective.endswith("-interactive")):
+            msg += (
+                f"\nNote: {effective} partition is preemptible — "
+                "ensure your job supports checkpointing."
+            )
         return msg
 
     # ── Job monitoring ────────────────────────────────────────────────
@@ -131,6 +234,7 @@ def create_server() -> FastMCP:
             "--user", target_user,
         ]
         if partition:
+            _validate_partition(partition)
             cmd += ["--partition", partition]
         if state:
             cmd += ["--state", state]
@@ -188,6 +292,59 @@ def create_server() -> FastMCP:
         return "\n".join(output_lines)
 
     @mcp.tool()
+    async def wait_for_job(
+        job_id: str,
+        poll_interval: int = 30,
+        timeout: Optional[int] = None,
+    ) -> str:
+        """Block until a Slurm job reaches a terminal state (or timeout).
+
+        Polls squeue first (fast, ~50ms) and falls back to sacct once the job
+        has left the queue. If both are empty for 6 consecutive polls, returns
+        state=UNKNOWN rather than waiting forever. poll_interval is clamped to
+        a 5-second floor.
+        """
+        if not _JOB_ID_RE.match(job_id.split(".")[0]):
+            raise ToolError(f"Invalid job ID format: {job_id}")
+        if timeout is not None and timeout <= 0:
+            raise ToolError("timeout must be positive")
+        poll_interval = max(5, poll_interval)
+
+        MAX_EMPTY = 6
+        start = time.monotonic()
+        empty_polls = 0
+        last_state: dict[str, str] = {}
+
+        while True:
+            state = await _fetch_job_state(job_id)
+
+            if state:
+                empty_polls = 0
+                last_state = state
+                raw_state = state.get("State", "").split()[0] if state.get("State") else ""
+                if raw_state in _TERMINAL_STATES:
+                    return json.dumps({"job_id": job_id, **state, "terminal": True}, indent=2)
+            else:
+                empty_polls += 1
+                if empty_polls >= MAX_EMPTY:
+                    return json.dumps({
+                        "job_id": job_id,
+                        "state": "UNKNOWN",
+                        "terminal": False,
+                        "reason": "not visible to scheduler or accounting",
+                    }, indent=2)
+
+            if timeout is not None and (time.monotonic() - start) >= timeout:
+                return json.dumps({
+                    "job_id": job_id,
+                    **last_state,
+                    "terminal": False,
+                    "reason": "timeout",
+                }, indent=2)
+
+            await asyncio.sleep(poll_interval)
+
+    @mcp.tool()
     async def tail_output(
         job_id: Optional[str] = None,
         file_path: Optional[str] = None,
@@ -202,59 +359,62 @@ def create_server() -> FastMCP:
             raise ToolError("Provide either job_id or file_path.")
 
         if job_id and not file_path:
-            # Look up working directory from sacct
-            cmd = ["sacct", "-j", job_id, "--format=WorkDir", "--parsable2", "--noheader"]
-            stdout = await client.run_remote(cmd)
-            if not stdout:
-                raise ToolError(f"Could not find working directory for job {job_id}.")
+            file_path = await _locate_job_log(job_id)
 
-            work_dir = stdout.splitlines()[0].split("|")[0].strip()
-            output_dir = config.output_dir
-            candidates = [
-                os.path.join(work_dir, output_dir, f"{job_id}.out"),
-                os.path.join(work_dir, f"slurm-{job_id}.out"),
-                os.path.join(work_dir, f"{job_id}.out"),
-            ]
+        def _tail() -> tuple[list[str], int]:
+            if not os.path.exists(file_path):
+                raise ToolError(f"File not found: {file_path}")
+            with open(file_path, errors="replace") as f:
+                all_lines = f.readlines()
+            return all_lines[-lines:], len(all_lines)
 
-            found = None
-            for candidate in candidates:
-                if os.path.exists(candidate):
-                    found = candidate
-                    break
-            if not found:
-                raise ToolError(f"No output file found for job {job_id}. Tried:\n" + "\n".join(candidates))
-            file_path = found
-
-        if not os.path.exists(file_path):
-            raise ToolError(f"File not found: {file_path}")
-
-        with open(file_path, errors="replace") as f:
-            all_lines = f.readlines()
-
-        tail = all_lines[-lines:]
-        header = f"=== {file_path} (last {len(tail)} of {len(all_lines)} lines) ==="
+        tail, total = await asyncio.to_thread(_tail)
+        header = f"=== {file_path} (last {len(tail)} of {total} lines) ==="
         return header + "\n" + "".join(tail)
 
     # ── Cluster info ──────────────────────────────────────────────────
 
     @mcp.tool()
     async def gpu_status(partition: Optional[str] = None) -> str:
-        """Show GPU availability across the cluster.
+        """Show GPU availability across the cluster as structured JSON.
 
-        Uses the cluster's GPU status command (sgpu by default).
+        Parses `sgpu` output into {partition, total, state, types[name,count,vram_gb]}.
+        VRAM is looked up from a static map (h100=80, h200=141, a100=80, l40s=48,
+        a6000=48, titanrtx=24). The original sgpu text is preserved under `summary`
+        for human display. Cached for 15 seconds.
         """
+        key = partition or "__default__"
+        now = time.monotonic()
+        entry = gpu_cache.get(key)
+        if entry and (now - entry[0]) < _GPU_STATUS_TTL_SECONDS:
+            return entry[1]
+
+        base_cmd = shlex.split(config.gpu_command)
         if partition:
-            cmd = config.gpu_command.replace("-p iris", f"-p {partition}")
-        else:
-            cmd = config.gpu_command
-        return await client.run_remote(cmd)
+            _validate_partition(partition)
+            if "-p" in base_cmd:
+                idx = base_cmd.index("-p")
+                base_cmd[idx + 1] = partition
+            else:
+                base_cmd += ["-p", partition]
+
+        raw = await client.run_remote(base_cmd)
+        parsed = parse_sgpu(raw)
+        rendered = json.dumps({
+            **parsed,
+            "summary": raw,
+            "source": "sgpu+static_map",
+        }, indent=2)
+        gpu_cache[key] = (now, rendered)
+        return rendered
 
     @mcp.tool()
     async def cluster_info(partition: Optional[str] = None) -> str:
         """Show Slurm cluster overview: partitions, node states, and GPU resources."""
-        cmd = "sinfo --format='%P|%a|%l|%D|%T|%G' --noheader"
+        cmd = ["sinfo", "--format=%P|%a|%l|%D|%T|%G", "--noheader"]
         if partition:
-            cmd += f" -p {partition}"
+            _validate_partition(partition)
+            cmd += ["-p", partition]
 
         stdout = await client.run_remote(cmd)
         if not stdout:
@@ -309,6 +469,67 @@ def create_server() -> FastMCP:
             "  tmux attach",
         ])
 
+    # ── Wandb cross-reference ─────────────────────────────────────────
+
+    @mcp.tool()
+    async def wandb_for_job(job_id: str) -> str:
+        """Find the wandb run URL for a Slurm job.
+
+        Prefers ${workdir}/wandb/latest-run/files/wandb-metadata.json (structured).
+        Falls back to regex-scanning the first 64 KB of the job log. Caches
+        results keyed on (log_path, mtime).
+        """
+        if not _JOB_ID_RE.match(job_id.split(".")[0]):
+            raise ToolError(f"Invalid job ID format: {job_id}")
+
+        # Locate workdir via sacct (reuse the log-locator's first step inline —
+        # we need workdir specifically for the wandb/ subdirectory).
+        sacct_cmd = ["sacct", "-j", job_id, "--format=WorkDir", "--parsable2", "--noheader"]
+        stdout = await client.run_remote(sacct_cmd)
+        if not stdout.strip():
+            raise ToolError(f"Could not find working directory for job {job_id}.")
+        work_dir = stdout.splitlines()[0].split("|")[0].strip()
+
+        metadata_path = os.path.join(work_dir, "wandb", "latest-run", "files", "wandb-metadata.json")
+
+        def _read_metadata() -> Optional[str]:
+            if not os.path.exists(metadata_path):
+                return None
+            try:
+                with open(metadata_path) as f:
+                    data = json.load(f)
+                url = data.get("url")
+                return url if isinstance(url, str) else None
+            except (OSError, ValueError):
+                return None
+
+        url = await asyncio.to_thread(_read_metadata)
+        if url:
+            return url
+
+        # Fallback: regex-scan first 64 KB of the log file.
+        log_path = await _locate_job_log(job_id)
+
+        try:
+            mtime = await asyncio.to_thread(os.path.getmtime, log_path)
+        except OSError:
+            mtime = 0.0
+
+        cached = wandb_cache.get(log_path)
+        if cached and cached[0] == mtime:
+            return cached[1] or "not found"
+
+        def _grep() -> Optional[str]:
+            with open(log_path, "rb") as f:
+                blob = f.read(65536)
+            text = blob.decode(errors="replace")
+            m = _WANDB_URL_RE.search(text)
+            return m.group(0) if m else None
+
+        found = await asyncio.to_thread(_grep)
+        wandb_cache[log_path] = (mtime, found)
+        return found or "not found"
+
     # ── Environment ───────────────────────────────────────────────────
 
     @mcp.tool()
@@ -318,12 +539,15 @@ def create_server() -> FastMCP:
         if not os.path.exists(conda_bin):
             raise ToolError(f"Conda not found at {conda_bin}. Set SLURM_MCP_CONDA_DIR.")
 
-        result = subprocess.run(
-            [conda_bin, "env", "list", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        def _run() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [conda_bin, "env", "list", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        result = await asyncio.to_thread(_run)
         if result.returncode != 0:
             raise ToolError(f"conda env list failed: {result.stderr}")
 
@@ -338,7 +562,7 @@ def create_server() -> FastMCP:
             lines.append(f"  {name:20s}  {env_path}")
         return "\n".join(lines)
 
-    # ── Disk usage ────────────────────────────────────────────────────
+    # ── Disk / quota ──────────────────────────────────────────────────
 
     @mcp.tool()
     async def disk_usage(path: Optional[str] = None) -> str:
@@ -347,27 +571,66 @@ def create_server() -> FastMCP:
         Defaults to the shared working directory. Also shows home directory usage
         as a reminder to keep it small.
         """
-        results: list[str] = []
         target = path or config.resolved_working_dir
 
-        # Check target
-        du = subprocess.run(
-            ["du", "-sh", target],
-            capture_output=True, text=True, timeout=30,
-        )
-        if du.returncode == 0 and du.stdout.strip():
-            results.append(f"{target}: {du.stdout.strip().split()[0]}")
-
-        # Also check home dir if different from target
-        home = config.resolved_home_dir
-        if home != target and os.path.exists(home):
-            du = subprocess.run(
-                ["du", "-sh", home],
+        def _du(p: str) -> Optional[str]:
+            r = subprocess.run(
+                ["du", "-sh", p],
                 capture_output=True, text=True, timeout=30,
             )
-            if du.returncode == 0 and du.stdout.strip():
-                results.append(f"{home}: {du.stdout.strip().split()[0]} (keep this small!)")
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip().split()[0]
+            return None
+
+        results: list[str] = []
+        target_size = await asyncio.to_thread(_du, target)
+        if target_size:
+            results.append(f"{target}: {target_size}")
+
+        home = config.resolved_home_dir
+        if home != target and os.path.exists(home):
+            home_size = await asyncio.to_thread(_du, home)
+            if home_size:
+                results.append(f"{home}: {home_size} (keep this small!)")
 
         return "\n".join(results) if results else "Could not determine disk usage."
+
+    @mcp.tool()
+    async def quota_check() -> str:
+        """Report filesystem quota for home and shared working directories.
+
+        Probes filesystem type via `stat -f -c %T` first, then dispatches to the
+        correct quota command (Lustre → lfs quota, BeeGFS → beegfs-ctl,
+        NFS/other → df). Home directory always uses `quota -s`.
+        """
+        work_dir = config.resolved_working_dir
+        try:
+            fs_type = (await client.run_remote(["stat", "-f", "-c", "%T", work_dir])).strip().lower()
+        except ToolError as e:
+            fs_type = f"<error: {e}>"
+
+        async def _safe(cmd: list[str]) -> str:
+            try:
+                return await client.run_remote(cmd)
+            except ToolError as e:
+                return f"<error: {e}>"
+
+        home_raw = await _safe(["quota", "-s"])
+
+        if "lustre" in fs_type:
+            iris_raw = await _safe(["lfs", "quota", "-hu", config.username, work_dir])
+            iris_source = "lfs"
+        elif "beegfs" in fs_type:
+            iris_raw = await _safe(["beegfs-ctl", "--getquota", "--uid", config.username])
+            iris_source = "beegfs-ctl"
+        else:
+            iris_raw = await _safe(["df", "-h", work_dir])
+            iris_source = "df"
+
+        return json.dumps({
+            "fs_type": fs_type,
+            "home": {"source": "quota -s", "raw": home_raw},
+            "iris": {"source": iris_source, "path": work_dir, "raw": iris_raw},
+        }, indent=2)
 
     return mcp

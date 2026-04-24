@@ -21,6 +21,10 @@ class SlurmConfig(BaseSettings):
     login_node: str = "sc.stanford.edu"
     ssh_timeout: int = 10
     command_timeout: int = 60
+    # SSH connection multiplexing — ControlPath %C hashes host/port/user into a
+    # fixed-length name, avoiding the Unix sun_path ~104-char limit.
+    ssh_control_path: str = "~/.ssh/cm/cm-%C"
+    ssh_control_persist: str = "600s"
 
     # Slurm defaults
     default_account: str = "iris"
