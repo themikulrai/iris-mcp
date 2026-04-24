@@ -149,6 +149,7 @@ def create_server() -> FastMCP:
         exclude: Optional[str] = None,
         constraint: Optional[str] = None,
         extra_args: Optional[str] = None,
+        script_args: Optional[str] = None,
     ) -> str:
         """Submit a Slurm batch job via sbatch.
 
@@ -158,6 +159,10 @@ def create_server() -> FastMCP:
         Uses configured defaults for partition, account, GPUs, memory, and time
         when not specified. Automatically creates the output directory before
         submission.
+
+        `extra_args` passes additional flags to sbatch itself (e.g. '--nice=10000').
+        `script_args` passes arguments to the script after the script path
+        (e.g. '--num_train_steps=20 --lr=1e-4').
 
         `dependency` accepts standard Slurm syntax (e.g. 'afterok:12345',
         'afternotok:12345', 'afterany:12345:12346', 'singleton').
@@ -199,6 +204,8 @@ def create_server() -> FastMCP:
             extra_args=extra_args,
         )
         args.append(script_path)
+        if script_args:
+            args += shlex.split(script_args)
 
         stdout = await client.run_remote(args)
 
