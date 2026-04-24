@@ -48,6 +48,8 @@ def test_default_slurm_values():
 
 
 def test_missing_username_raises():
+    # _env_file=None disables .env discovery so the test doesn't pick up a
+    # real .env in the project root.
     with patch.dict("os.environ", {}, clear=True):
         with pytest.raises(Exception):
-            SlurmConfig()
+            SlurmConfig(_env_file=None)

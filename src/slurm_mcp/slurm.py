@@ -110,6 +110,7 @@ class SlurmClient:
 
         proc = await asyncio.create_subprocess_exec(
             *ssh_cmd,
+            stdin=asyncio.subprocess.DEVNULL,  # never inherit the parent's stdin
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -117,15 +118,21 @@ class SlurmClient:
         effective_timeout = timeout or self.config.command_timeout
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), effective_timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise ToolError(f"Command timed out after {effective_timeout}s: {cmd_str}")
-        except asyncio.CancelledError:
-            # Client disconnect or task cancellation — don't orphan ssh.
+        except BaseException as exc:
+            # ANY early exit (TimeoutError, CancelledError, KeyboardInterrupt, ...)
+            # must reap the subprocess. Otherwise the asyncio subprocess transport
+            # is GC'd later with "RuntimeError: Event loop is closed", which tears
+            # down FastMCP's stdio loop and disconnects the whole MCP server.
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
+            try:
+                await asyncio.wait_for(proc.wait(), 2)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            if isinstance(exc, asyncio.TimeoutError):
+                raise ToolError(f"Command timed out after {effective_timeout}s: {cmd_str}")
             raise
 
         stdout_str = stdout.decode().strip()
