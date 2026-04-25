@@ -172,6 +172,13 @@ def create_server() -> FastMCP:
         if not script_path and not script_content:
             raise ToolError("Provide either script_path or script_content.")
 
+        # For script_path jobs the script already contains #SBATCH headers, so
+        # command-line resource flags must NOT be emitted unless the caller
+        # explicitly provides them (sbatch CLI flags always override #SBATCH
+        # directives). For inline script_content there are no headers, so we
+        # fall back to config defaults.
+        inline = bool(script_content)
+
         work_dir = working_dir or config.resolved_working_dir
         output_dir = config.output_dir
         output_pattern = f"{output_dir}/%j.out"
@@ -188,12 +195,12 @@ def create_server() -> FastMCP:
         args = client.build_sbatch_args(
             job_name=job_name,
             partition=partition,
-            gpus=gpus,
+            gpus=gpus if gpus is not None else (config.default_gpus if inline else None),
             gpu_type=gpu_type,
             nodes=nodes,
-            cpus=cpus,
-            mem=mem,
-            time_limit=time_limit,
+            cpus=cpus if cpus is not None else (config.default_cpus if inline else None),
+            mem=mem if mem is not None else (config.default_mem if inline else None),
+            time_limit=time_limit if time_limit is not None else (config.default_time if inline else None),
             output_pattern=output_pattern,
             working_dir=work_dir,
             array=array,

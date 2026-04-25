@@ -183,12 +183,16 @@ class SlurmClient:
         args += ["--partition", partition or cfg.default_partition]
         args += ["--account", account or cfg.default_account]
         args += ["--nodes", str(nodes)]
-        args += ["--cpus-per-task", str(cpus or cfg.default_cpus)]
-        args += ["--mem", mem or cfg.default_mem]
-        args += ["--time", time_limit or cfg.default_time]
-
-        gres = f"gpu:{gpu_type}:{gpus or cfg.default_gpus}" if gpu_type else f"gpu:{gpus or cfg.default_gpus}"
-        args += ["--gres", gres]
+        if cpus is not None:
+            args += ["--cpus-per-task", str(cpus)]
+        if mem is not None:
+            args += ["--mem", mem]
+        if time_limit is not None:
+            args += ["--time", time_limit]
+        if gpus is not None or gpu_type is not None:
+            effective_gpus = gpus if gpus is not None else 1
+            gres = f"gpu:{gpu_type}:{effective_gpus}" if gpu_type else f"gpu:{effective_gpus}"
+            args += ["--gres", gres]
 
         if output_pattern:
             args += ["--output", output_pattern]

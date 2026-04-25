@@ -19,8 +19,12 @@ def test_build_sbatch_args_defaults(client):
     assert args[args.index("--partition") + 1] == "iris"
     assert "--account" in args
     assert args[args.index("--account") + 1] == "iris"
-    assert "--gres" in args
-    assert args[args.index("--gres") + 1] == "gpu:1"
+    # No gpu_type/gpus → no --gres emitted; script's own #SBATCH --gres governs.
+    assert "--gres" not in args
+    # No explicit cpus/mem/time → not emitted; script's #SBATCH headers govern.
+    assert "--cpus-per-task" not in args
+    assert "--mem" not in args
+    assert "--time" not in args
 
 
 def test_build_sbatch_args_custom(client):
