@@ -35,6 +35,13 @@ class SlurmConfig(BaseSettings):
     default_cpus: int = 4
     output_dir: str = "slurm"
 
+    # Auto-routing: when submit_job is called without an explicit partition,
+    # try the high-priority partition first; fall back to default_partition
+    # if the user already has >= auto_route_cap jobs there (hard quota).
+    auto_route_to_hi: bool = True
+    auto_route_target: str = "iris-hi"
+    auto_route_cap: int = 6
+
     # Directories (auto-derived from username if not set)
     working_dir: Optional[str] = None
     conda_dir: Optional[str] = None

@@ -215,7 +215,11 @@ async def test_cluster_info_rejects_injection(mcp_server, mock_env):
         ("iris-hi", False),
         ("iris-interactive", False),
         ("iris-hi-interactive", False),
-        (None, True),  # default partition is iris
+        # When partition is None, auto-routing kicks in. The mock returns the
+        # same "Submitted batch job 42" string for every remote call, including
+        # the squeue probe — splitlines() gives count=1 which is well under the
+        # cap, so iris-hi is selected (no preemption warning).
+        (None, False),
     ],
 )
 async def test_submit_job_preemption_warning(mcp_server, mock_env, tmp_path, partition, expect_warn):
@@ -260,6 +264,91 @@ async def test_gpu_status_caches(mcp_server, mock_env):
     assert rr.call_count == 1
 
 
+# ── Auto-routing to iris-hi unless at cap ────────────────────────────
+
+
+def _captured_partition(captured_argv: list[list[str]]) -> str | None:
+    """Extract the --partition value from the captured sbatch invocation."""
+    for argv in captured_argv:
+        if argv and argv[0] == "sbatch" and "--partition" in argv:
+            return argv[argv.index("--partition") + 1]
+    return None
+
+
+@pytest.mark.asyncio
+async def test_submit_job_auto_routes_to_hi_when_under_cap(mcp_server, mock_env, tmp_path):
+    """Caller omits partition → server checks iris-hi count → < cap → uses iris-hi."""
+    captured = []
+
+    async def fake_run(cmd, timeout=None):
+        captured.append(cmd)
+        if cmd[0] == "squeue":
+            # 3 user jobs in iris-hi, well under cap of 6
+            return "111\n222\n333"
+        return "Submitted batch job 42"
+
+    with patch("slurm_mcp.slurm.SlurmClient.run_remote", side_effect=fake_run):
+        result = await mcp_server.call_tool(
+            "submit_job",
+            {"script_content": "#!/bin/bash\necho ok", "working_dir": str(tmp_path)},
+        )
+
+    text = result[0][0].text
+    assert _captured_partition(captured) == "iris-hi"
+    assert "auto-routed to iris-hi" in text
+    assert "preemptible" not in text  # iris-hi is not preemptible
+
+
+@pytest.mark.asyncio
+async def test_submit_job_falls_back_when_at_cap(mcp_server, mock_env, tmp_path):
+    """Caller omits partition → iris-hi at cap (6 jobs) → falls back to default (iris)."""
+    captured = []
+
+    async def fake_run(cmd, timeout=None):
+        captured.append(cmd)
+        if cmd[0] == "squeue":
+            return "\n".join(str(i) for i in range(6))  # 6 jobs == cap
+        return "Submitted batch job 99"
+
+    with patch("slurm_mcp.slurm.SlurmClient.run_remote", side_effect=fake_run):
+        result = await mcp_server.call_tool(
+            "submit_job",
+            {"script_content": "#!/bin/bash\necho ok", "working_dir": str(tmp_path)},
+        )
+
+    text = result[0][0].text
+    assert _captured_partition(captured) == "iris"
+    assert "iris-hi at cap" in text
+    assert "preemptible" in text  # falling back to iris triggers the warning
+
+
+@pytest.mark.asyncio
+async def test_submit_job_explicit_partition_skips_auto_route(mcp_server, mock_env, tmp_path):
+    """Caller pins partition=iris → no squeue probe, request honored verbatim."""
+    captured = []
+
+    async def fake_run(cmd, timeout=None):
+        captured.append(cmd)
+        return "Submitted batch job 7"
+
+    with patch("slurm_mcp.slurm.SlurmClient.run_remote", side_effect=fake_run):
+        result = await mcp_server.call_tool(
+            "submit_job",
+            {
+                "script_content": "#!/bin/bash\necho ok",
+                "working_dir": str(tmp_path),
+                "partition": "iris",
+            },
+        )
+
+    text = result[0][0].text
+    # Exactly one remote call (the sbatch); no squeue probe for auto-route.
+    assert len(captured) == 1
+    assert captured[0][0] == "sbatch"
+    assert _captured_partition(captured) == "iris"
+    assert "auto-routed" not in text
+
+
 # ── Phase 4b: submit_job forwards new sbatch params ──────────────────
 
 
@@ -285,7 +374,9 @@ async def test_submit_job_new_params_passed_through(mcp_server, mock_env, tmp_pa
         )
 
     assert captured, "submit_job did not invoke run_remote"
-    argv = captured[0]
+    sbatch_argv = next((c for c in captured if c and c[0] == "sbatch"), None)
+    assert sbatch_argv is not None, "sbatch was not invoked"
+    argv = sbatch_argv
     assert "--dependency" in argv and argv[argv.index("--dependency") + 1] == "afterok:100"
     assert "--nodelist" in argv and argv[argv.index("--nodelist") + 1] == "iris-hgx-2"
     assert "--exclude" in argv and argv[argv.index("--exclude") + 1] == "iris-1"

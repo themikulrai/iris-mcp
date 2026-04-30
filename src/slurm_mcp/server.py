@@ -130,6 +130,37 @@ def create_server() -> FastMCP:
 
     # ── Job submission ────────────────────────────────────────────────
 
+    async def _auto_select_partition() -> tuple[str, Optional[str]]:
+        """Pick a partition when the caller did not specify one.
+
+        When `auto_route_to_hi` is enabled, prefer the high-priority partition
+        (`auto_route_target`) until the user already has `auto_route_cap`
+        jobs there (running + pending). Otherwise fall back to
+        `default_partition` so the new job can start immediately.
+
+        Returns (partition, note) where `note` is a human-readable explanation
+        appended to the submission response (None when no auto-routing fired).
+        """
+        if not config.auto_route_to_hi:
+            return config.default_partition, None
+        target = config.auto_route_target
+        cap = config.auto_route_cap
+        cmd = [
+            "squeue",
+            "--noheader",
+            "--user", config.username,
+            "--partition", target,
+            "-o", "%i",
+        ]
+        try:
+            out = await client.run_remote(cmd)
+        except Exception:
+            return config.default_partition, None
+        count = sum(1 for line in out.splitlines() if line.strip())
+        if count < cap:
+            return target, f"auto-routed to {target} ({count}/{cap} of your jobs already there)"
+        return config.default_partition, f"{target} at cap ({count}/{cap}); using {config.default_partition}"
+
     @mcp.tool()
     async def submit_job(
         script_path: Optional[str] = None,
@@ -192,6 +223,11 @@ def create_server() -> FastMCP:
             tmp_dir = Path(work_dir) / ".slurm_scripts"
             script_path = await asyncio.to_thread(_write_inline_script, tmp_dir, script_content)
 
+        # Auto-routing kicks in only when caller did not pin a partition.
+        auto_note: Optional[str] = None
+        if partition is None:
+            partition, auto_note = await _auto_select_partition()
+
         args = client.build_sbatch_args(
             job_name=job_name,
             partition=partition,
@@ -219,6 +255,9 @@ def create_server() -> FastMCP:
         msg = f"Job submitted: {stdout}"
         if script_content:
             msg += f"\nScript saved to: {script_path}"
+
+        if auto_note:
+            msg += f"\nPartition: {auto_note}"
 
         effective = partition or config.default_partition
         if not (effective.endswith("-hi") or effective.endswith("-interactive")):
